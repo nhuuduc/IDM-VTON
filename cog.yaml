@@ -1,0 +1,17 @@
+image: "r8.im/nhuuduc/idm-vton"
+
+build:
+  gpu: true
+  cuda: "11.8"
+  python_version: "3.10"
+  python_packages:
+    - torch==2.0.1
+    - torchvision==0.15.2
+    - accelerate==0.25.0
+    - transformers==4.36.2
+    - diffusers==0.25.0
+    - einops==0.7.0
+    - scipy==1.11.1
+    - pillow==10.2.0
+
+predict: "predict.py:Predictor"
