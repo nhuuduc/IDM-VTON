@@ -10,6 +10,7 @@ build:
     - accelerate==0.25.0
     - transformers==4.36.2
     - diffusers==0.25.0
+    - huggingface_hub==0.25.2
     - einops==0.7.0
     - scipy==1.11.1
     - pillow==10.2.0
