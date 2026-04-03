@@ -5,14 +5,10 @@ build:
   cuda: "11.8"
   python_version: "3.10"
   python_packages:
-    - torch==2.0.1
-    - torchvision==0.15.2
-    - accelerate==0.25.0
-    - transformers==4.36.2
-    - diffusers==0.25.0
+    - torch==2.2.2
+    - torchvision==0.17.2
     - huggingface_hub==0.25.2
-    - einops==0.7.0
-    - scipy==1.11.1
     - pillow==10.2.0
+    - https://github.com/fashn-AI/fashn-vton-1.5/archive/refs/heads/main.zip
 
 predict: "predict.py:Predictor"

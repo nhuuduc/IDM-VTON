@@ -1,191 +1,77 @@
-from contextlib import nullcontext
-
-import numpy as np
-import torch
 from cog import BasePredictor, Input, Path
-from PIL import Image
-from diffusers import AutoencoderKL, DDPMScheduler
-from torchvision import transforms
-from transformers import (
-    AutoTokenizer,
-    CLIPImageProcessor,
-    CLIPTextModel,
-    CLIPTextModelWithProjection,
-    CLIPVisionModelWithProjection,
-)
-
-from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
-from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModelRef
-from src.unet_hacked_tryon import UNet2DConditionModel
 
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype = torch.float16 if self.device == "cuda" else torch.float32
-        base_path = "yisol/IDM-VTON"
+        import os
 
-        unet = UNet2DConditionModel.from_pretrained(
-            base_path,
-            subfolder="unet",
-            torch_dtype=self.dtype,
-        )
-        tokenizer_one = AutoTokenizer.from_pretrained(
-            base_path,
-            subfolder="tokenizer",
-            revision=None,
-            use_fast=False,
-        )
-        tokenizer_two = AutoTokenizer.from_pretrained(
-            base_path,
-            subfolder="tokenizer_2",
-            revision=None,
-            use_fast=False,
-        )
-        noise_scheduler = DDPMScheduler.from_pretrained(base_path, subfolder="scheduler")
+        from fashn_human_parser import FashnHumanParser
+        from fashn_vton import TryOnPipeline
+        from huggingface_hub import hf_hub_download
 
-        text_encoder_one = CLIPTextModel.from_pretrained(
-            base_path,
-            subfolder="text_encoder",
-            torch_dtype=self.dtype,
+        self.weights_dir = "/src/weights"
+        os.makedirs(self.weights_dir, exist_ok=True)
+        dwpose_dir = os.path.join(self.weights_dir, "dwpose")
+        os.makedirs(dwpose_dir, exist_ok=True)
+
+        hf_hub_download(
+            repo_id="fashn-ai/fashn-vton-1.5",
+            filename="model.safetensors",
+            local_dir=self.weights_dir,
         )
-        text_encoder_two = CLIPTextModelWithProjection.from_pretrained(
-            base_path,
-            subfolder="text_encoder_2",
-            torch_dtype=self.dtype,
+        hf_hub_download(
+            repo_id="fashn-ai/DWPose",
+            filename="yolox_l.onnx",
+            local_dir=dwpose_dir,
         )
-        image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-            base_path,
-            subfolder="image_encoder",
-            torch_dtype=self.dtype,
-        )
-        vae = AutoencoderKL.from_pretrained(
-            base_path,
-            subfolder="vae",
-            torch_dtype=self.dtype,
-        )
-        unet_encoder = UNet2DConditionModelRef.from_pretrained(
-            base_path,
-            subfolder="unet_encoder",
-            torch_dtype=self.dtype,
+        hf_hub_download(
+            repo_id="fashn-ai/DWPose",
+            filename="dw-ll_ucoco_384.onnx",
+            local_dir=dwpose_dir,
         )
 
-        self.tensor_transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
+        # Trigger parser weights cache at build/runtime setup once.
+        _ = FashnHumanParser(device="cpu")
 
-        self.pipe = TryonPipeline.from_pretrained(
-            base_path,
-            unet=unet,
-            vae=vae,
-            feature_extractor=CLIPImageProcessor(),
-            text_encoder=text_encoder_one,
-            text_encoder_2=text_encoder_two,
-            tokenizer=tokenizer_one,
-            tokenizer_2=tokenizer_two,
-            scheduler=noise_scheduler,
-            image_encoder=image_encoder,
-            torch_dtype=self.dtype,
-        )
-
-        self.pipe.unet_encoder = unet_encoder
-        self.pipe.to(self.device)
-        self.pipe.unet_encoder.to(self.device)
-        self.pipe.unet_encoder.eval()
-        self.pipe.unet.eval()
-
-    def _default_mask(self, image: Image.Image) -> Image.Image:
-        width, height = image.size
-        mask = np.zeros((height, width), dtype=np.uint8)
-        left = int(width * 0.25)
-        right = int(width * 0.75)
-        top = int(height * 0.20)
-        bottom = int(height * 0.80)
-        mask[top:bottom, left:right] = 255
-        return Image.fromarray(mask)
+        self.pipeline = TryOnPipeline(weights_dir=self.weights_dir)
 
     def predict(
         self,
-        human_image: Path = Input(description="Person image"),
+        person_image: Path = Input(description="Person image"),
         garment_image: Path = Input(description="Garment image"),
-        garment_description: str = Input(
-            description="Garment text prompt",
-            default="a short-sleeve shirt",
+        category: str = Input(
+            description='Garment category: "tops", "bottoms", or "one-pieces"',
+            choices=["tops", "bottoms", "one-pieces"],
+            default="tops",
         ),
-        mask_image: Path = Input(
-            description="Optional mask image, white area is inpaint region",
-            default=None,
+        garment_photo_type: str = Input(
+            description='Garment photo type: "model" or "flat-lay"',
+            choices=["model", "flat-lay"],
+            default="model",
         ),
-        num_inference_steps: int = Input(default=30, ge=1, le=100),
-        guidance_scale: float = Input(default=2.0, ge=0.1, le=20),
+        num_samples: int = Input(default=1, ge=1, le=4),
+        num_timesteps: int = Input(default=30, ge=10, le=60),
+        guidance_scale: float = Input(default=1.5, ge=0.1, le=5.0),
         seed: int = Input(default=42),
+        segmentation_free: bool = Input(default=True),
     ) -> Path:
-        human_img = Image.open(human_image).convert("RGB").resize((768, 1024))
-        garm_img = Image.open(garment_image).convert("RGB").resize((768, 1024))
+        from PIL import Image
 
-        if mask_image:
-            mask = Image.open(mask_image).convert("L").resize((768, 1024))
-        else:
-            mask = self._default_mask(human_img)
+        person = Image.open(person_image).convert("RGB")
+        garment = Image.open(garment_image).convert("RGB")
 
-        autocast_ctx = torch.cuda.amp.autocast() if self.device == "cuda" else nullcontext()
-        generator = torch.Generator(self.device).manual_seed(seed)
+        result = self.pipeline(
+            person_image=person,
+            garment_image=garment,
+            category=category,
+            garment_photo_type=garment_photo_type,
+            num_samples=num_samples,
+            num_timesteps=num_timesteps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            segmentation_free=segmentation_free,
+        )
 
-        with torch.no_grad(), autocast_ctx:
-            prompt = f"model is wearing {garment_description}"
-            negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
-
-            (
-                prompt_embeds,
-                negative_prompt_embeds,
-                pooled_prompt_embeds,
-                negative_pooled_prompt_embeds,
-            ) = self.pipe.encode_prompt(
-                prompt,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=True,
-                negative_prompt=negative_prompt,
-            )
-
-            cloth_prompt = f"a photo of {garment_description}"
-            (
-                prompt_embeds_c,
-                _,
-                _,
-                _,
-            ) = self.pipe.encode_prompt(
-                [cloth_prompt],
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=False,
-                negative_prompt=[negative_prompt],
-            )
-
-            garm_tensor = self.tensor_transform(garm_img).unsqueeze(0).to(self.device, self.dtype)
-            # Pose condition is approximated by person image to keep API simple.
-            pose_img = self.tensor_transform(human_img).unsqueeze(0).to(self.device, self.dtype)
-
-            images = self.pipe(
-                prompt_embeds=prompt_embeds.to(self.device, self.dtype),
-                negative_prompt_embeds=negative_prompt_embeds.to(self.device, self.dtype),
-                pooled_prompt_embeds=pooled_prompt_embeds.to(self.device, self.dtype),
-                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(self.device, self.dtype),
-                num_inference_steps=num_inference_steps,
-                generator=generator,
-                strength=1.0,
-                pose_img=pose_img,
-                text_embeds_cloth=prompt_embeds_c.to(self.device, self.dtype),
-                cloth=garm_tensor,
-                mask_image=mask,
-                image=human_img,
-                height=1024,
-                width=768,
-                ip_adapter_image=garm_img,
-                guidance_scale=guidance_scale,
-            )[0]
-
-        output = "/tmp/output.png"
-        images[0].save(output)
-        return Path(output)
+        out_path = "/tmp/output.png"
+        result.images[0].save(out_path)
+        return Path(out_path)
