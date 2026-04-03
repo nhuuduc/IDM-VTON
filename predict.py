@@ -1,5 +1,4 @@
 from contextlib import nullcontext
-from typing import Optional
 
 import numpy as np
 import torch
@@ -116,7 +115,7 @@ class Predictor(BasePredictor):
             description="Garment text prompt",
             default="a short-sleeve shirt",
         ),
-        mask_image: Optional[Path] = Input(
+        mask_image: Path = Input(
             description="Optional mask image, white area is inpaint region",
             default=None,
         ),
